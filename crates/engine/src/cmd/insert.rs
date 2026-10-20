@@ -484,7 +484,7 @@ pub fn bookmark_span(doc: &wordcraft_doc::Document, name: &str, start: &Pos) -> 
 
 /// Remove bookmark `name`'s start and end marks, in whichever paragraphs and stories they are,
 /// keeping the selection on the same text. Returns whether the bookmark was there.
-fn remove_bookmark(s: &mut Session, name: &str) -> Result<bool, CmdError> {
+pub(crate) fn remove_bookmark(s: &mut Session, name: &str) -> Result<bool, CmdError> {
     let mark_len = wordcraft_doc::para::OBJ.len_utf8();
     let mut found = false;
     let stories: Vec<StoryRef> = std::iter::once(StoryRef::Body).chain(s.doc.parts.keys().map(|k| StoryRef::Part(*k))).collect();

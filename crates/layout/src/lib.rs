@@ -175,6 +175,10 @@ pub struct LayoutOptions {
     pub proof: ProofOptions,
     /// The word being typed, which gets no spelling squiggle until the caret leaves it (#1552).
     pub typing_word: Option<TypingWord>,
+    /// Section view: lay out only the top-level body blocks `start..end` (a heading and the text
+    /// under it). List numbers still count the blocks left out; pages left without any of these
+    /// blocks are dropped. `None` lays out the whole body.
+    pub only_blocks: Option<(usize, usize)>,
 }
 
 /// The word being typed ([`LayoutOptions::typing_word`]): the paragraph by its revision
@@ -2152,8 +2156,74 @@ pub fn layout(doc: &Document, cache: &mut LayoutCache, opts: &LayoutOptions) -> 
             }
         }
     };
+    if let Some(range) = opts.only_blocks {
+        keep_pages_of(&mut l, range);
+    }
     l.ms = now_ms() - t0;
     l
+}
+
+/// Advance the list counters past a block a section view leaves out, as laying it out would.
+fn count_labels(ctx: &mut Ctx, b: &Block) {
+    match b {
+        Block::Para(p) => {
+            ctx.next_label(p);
+        }
+        Block::Table(t) => {
+            for cell in t.rows.iter().flat_map(|r| r.cells.iter()) {
+                for b in cell.blocks.iter() {
+                    count_labels(ctx, b);
+                }
+            }
+        }
+    }
+}
+
+/// Section view: keep only the pages that show body blocks in `start..end` (at least one page),
+/// renumbering the index to match.
+fn keep_pages_of(l: &mut DocLayout, (start, end): (usize, usize)) {
+    let mut keep = vec![false; l.pages.len()];
+    for ((story, path), at) in &l.index {
+        if *story == StoryRef::Body && path.0.first().is_some_and(|b| (start..end).contains(&(*b as usize))) {
+            for (page, _) in at {
+                if let Some(k) = keep.get_mut(*page) {
+                    *k = true;
+                }
+            }
+        }
+    }
+    if !keep.iter().any(|k| *k) {
+        // Nothing to show (an empty range): keep the first page so there is somewhere to type.
+        if let Some(k) = keep.first_mut() {
+            *k = true;
+        }
+    }
+    let mut new_index = vec![None; keep.len()];
+    let mut n = 0;
+    for (i, k) in keep.iter().enumerate() {
+        if *k {
+            if let Some(slot) = new_index.get_mut(i) {
+                *slot = Some(n);
+            }
+            n += 1;
+        }
+    }
+    let mut i = 0;
+    l.pages.retain(|_| {
+        let k = keep.get(i).copied().unwrap_or(false);
+        i += 1;
+        k
+    });
+    for at in l.index.values_mut() {
+        at.retain_mut(|(page, _)| match new_index.get(*page).copied().flatten() {
+            Some(p) => {
+                *page = p;
+                true
+            }
+            None => false,
+        });
+    }
+    l.index.retain(|_, at| !at.is_empty());
 }
 
 /// One layout pass, numbering footnotes restarted on each page by `note_pages` ([`note_info`]),
@@ -2419,6 +2489,14 @@ fn layout_pass(
         while block <= last {
             let Some(b) = doc.body.get(block) else { break };
             let before = balance.then(|| (pb.pages.len(), Snap::take(&mut pb, &ctx)));
+            if let Some((from, to)) = opts.only_blocks
+                && !(from..to).contains(&block)
+            {
+                // Left out of a section view: its list items still count.
+                count_labels(&mut ctx, b);
+                block += 1;
+                continue;
+            }
             pb.mark_block();
             match (&**b, &outline) {
                 (Block::Para(p), Some(o)) => place_outline_para(&mut ctx, &mut pb, p, block, o),

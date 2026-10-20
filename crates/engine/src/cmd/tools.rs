@@ -67,7 +67,7 @@ fn is_english_entry(from: &str) -> bool {
 }
 
 /// Compare and Combine take the same settings.
-const COMPARE_PARAMS: &str = r#"{"path"?: string (revised document), "text"?: string (revised text), "original"?: string (original document; default: this one), "author"?: string (label changes with), "caseChanges"?: bool, "whiteSpace"?: bool, "formatting"?: bool (default true: differences count), "level"?: "word|character", "showIn"?: "original|revised|new" (revised/new: an untitled document), "moves"|"comments"|"tables"|"headersFooters"|"footnotes"|"textBoxes"|"fields"?: bool (accepted; not honoured yet except tables, always compared)}"#;
+const COMPARE_PARAMS: &str = r#"{"path"?: string (revised document), "data"?: base64 (revised document's bytes), "name"?: string (its file name, for the format; default .docx), "text"?: string (revised text), "original"?: string (original document; default: this one), "originalData"?: base64, "originalName"?: string, "author"?: string (label changes with), "caseChanges"?: bool, "whiteSpace"?: bool, "formatting"?: bool (default true: differences count), "level"?: "word|character", "showIn"?: "original|revised|new" (revised/new: an untitled document), "moves"|"comments"|"tables"|"headersFooters"|"footnotes"|"textBoxes"|"fields"?: bool (accepted; not honoured yet except tables, always compared)}"#;
 
 /// AutoCorrect Options (Word keeps them per user; the front end saves them with its preferences).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1164,18 +1164,28 @@ const MAX_CHAR_DIFF: usize = 2000;
 /// with `author`. Options Word offers that the comparison can't honour yet (moves, comments,
 /// headers and footers, footnotes, text boxes, fields) are accepted and listed in the result.
 fn compare(s: &mut Session, v: &Value) -> CmdResult {
-    let revised = if let Some(t) = p::str(v, "text") {
+    // The host sends documents as bytes (base64), with a name giving their format.
+    let from_data = |data: &str, name: Option<&str>, what: &str| -> Result<Document, CmdError> {
+        let bytes = super::insert::base64_decode(data).ok_or_else(|| CmdError::Params(format!("bad base64 `{what}`")))?;
+        crate::io::open_bytes(name.unwrap_or("document.docx"), &bytes).map_err(CmdError::Failed)
+    };
+    let revised = if let Some(d) = p::str(v, "data") {
+        from_data(d, p::str(v, "name"), "data")?
+    } else if let Some(t) = p::str(v, "text") {
         Document::from_text(t)
     } else if let Some(path) = p::str(v, "path") {
         crate::io::open_path(std::path::Path::new(path)).map_err(CmdError::Failed)?
     } else {
-        return Err(CmdError::Params("`path` or `text` of the revised document is required".into()));
+        return Err(CmdError::Params("`data`, `path` or `text` of the revised document is required".into()));
     };
     let show_in = p::str(v, "showIn").unwrap_or("original");
     if !matches!(show_in, "original" | "revised" | "new") {
         return Err(CmdError::Params("`showIn` is \"original\", \"revised\" or \"new\"".into()));
     }
-    if let Some(path) = p::str(v, "original") {
+    if let Some(d) = p::str(v, "originalData") {
+        s.doc = from_data(d, p::str(v, "originalName"), "originalData")?;
+        s.doc.ensure_nonempty();
+    } else if let Some(path) = p::str(v, "original") {
         let doc = crate::io::open_path(std::path::Path::new(path)).map_err(CmdError::Failed)?;
         s.doc = doc;
         s.doc.ensure_nonempty();
@@ -1964,6 +1974,20 @@ mod tests {
         assert!(r["changes"].as_u64().unwrap() >= 2);
         s.run("review.acceptAll", &json!({})).unwrap();
         assert_eq!(s.doc.plain_text(StoryRef::Body), "The dog sat.\nKeep this.\nNew line here.");
+    }
+
+    #[test]
+    fn compare_takes_documents_as_bytes() {
+        let docx = |t: &str| super::super::insert::base64_encode(&crate::io::save_bytes("x.docx", &Document::from_text(t)).unwrap());
+        let mut s = Session::new(Document::new());
+        let r = s
+            .run("review.compare", &json!({"originalData": docx("Version two.\nSame."), "data": docx("Version three.\nSame."), "author": "v3"}))
+            .unwrap();
+        assert!(r["changes"].as_u64().unwrap() >= 1);
+        assert!(s.doc.revisions.iter().all(|r| r.author == "v3"));
+        s.run("review.acceptAll", &json!({})).unwrap();
+        assert_eq!(s.doc.plain_text(StoryRef::Body), "Version three.\nSame.");
+        assert!(s.run("review.compare", &json!({"data": "%%%"})).is_err());
     }
 
     #[test]

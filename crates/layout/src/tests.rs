@@ -9423,3 +9423,32 @@ fn caret_height_ignores_line_spacing() {
         assert!((single - wide).abs() < 0.01, "{spacing:?}: single {single}, wide {wide}");
     }
 }
+
+#[test]
+fn section_view_lays_out_only_its_blocks_and_keeps_list_numbers() {
+    let mut d = Document::from_text("one\ntwo\nthree\nfour");
+    let id = d.numbering.add_list(wordcraft_doc::ListKind::Numbered);
+    d.format_paragraphs(&Pos::body(0, 0), &Pos::body(3, 4), &|p| p.numbering = Some(wordcraft_doc::props::NumRef { num: id, level: 0 })).unwrap();
+    d.format_paragraphs(&Pos::body(2, 0), &Pos::body(2, 0), &|p| p.page_break_before = Some(true)).unwrap();
+    assert_eq!(lay(&d).pages.len(), 2);
+    let only = |range| layout(&d, &mut LayoutCache::new(), &LayoutOptions { only_blocks: Some(range), ..Default::default() });
+    let labels = |l: &DocLayout| -> Vec<String> {
+        l.pages
+            .iter()
+            .flat_map(|p| p.items.iter())
+            .filter_map(|it| if let Placed::Lines { para, .. } = it { para.label.as_ref().map(|x| x.text.clone()) } else { None })
+            .collect()
+    };
+    // The second page's blocks alone: one page, numbered as in the whole document.
+    let l = only((2, 4));
+    assert_eq!(l.pages.len(), 1);
+    assert_eq!(labels(&l), vec!["3.", "4."]);
+    assert!(!l.index.contains_key(&(StoryRef::Body, Path::top(0))));
+    assert!(l.caret(&Pos::body(3, 0)).is_some());
+    // The first page's blocks alone: the page the later blocks start is dropped.
+    let l = only((0, 2));
+    assert_eq!(l.pages.len(), 1);
+    assert_eq!(labels(&l), vec!["1.", "2."]);
+    // A range past the end still leaves a page.
+    assert_eq!(only((9, 12)).pages.len(), 1);
+}

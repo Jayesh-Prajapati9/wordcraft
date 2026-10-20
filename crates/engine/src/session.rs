@@ -426,6 +426,7 @@ pub struct Session {
         (bool, wordcraft_layout::HideDeleted, bool),
         NumeralMode,
         Option<wordcraft_layout::TypingWord>,
+        Option<(usize, usize)>,
     )>,
     /// The word being typed, left without a spelling squiggle ([`TypedWord`]).
     typing: Option<TypedWord>,
@@ -494,6 +495,10 @@ pub struct Session {
     edit_marks: Vec<Pos>,
     /// How many Go Back presses since the last edit (which place comes next).
     go_back_step: usize,
+    /// What the host application lets its user do (`cmd::cronos`); only the host changes it.
+    pub policy: crate::cmd::cronos::Policy,
+    /// The one section laid out alone (`section.show`), if any.
+    pub section_view: Option<crate::cmd::cronos::SectionView>,
 }
 
 /// The number of edit locations Go Back cycles through (Word: four).
@@ -691,6 +696,8 @@ impl Session {
             widened: None,
             edit_marks: Vec::new(),
             go_back_step: 0,
+            policy: Default::default(),
+            section_view: None,
         }
     }
 
@@ -819,7 +826,8 @@ impl Session {
         let deleted = (hide_deleted, self.prefs.markup.hidden_deletions(), self.revisions_in_balloons());
         let outline = (mode == ViewMode::Outline).then(|| self.view.outline.view());
         let typing = self.typing_word();
-        if let Some((r, w, h, m, sp, l, pf, o, hd, n, t)) = &self.layout
+        let only = self.section_range();
+        if let Some((r, w, h, m, sp, l, pf, o, hd, n, t, on)) = &self.layout
             && *r == self.rev
             && (*w == width || mode == ViewMode::Print)
             && *h == height
@@ -830,6 +838,7 @@ impl Session {
             && *hd == deleted
             && *o == outline
             && *t == typing
+            && *on == only
         {
             return l.clone();
         }
@@ -849,9 +858,11 @@ impl Session {
             outline: outline.clone(),
             proof: wordcraft_layout::ProofOptions { grammar: self.prefs.mark_grammar, spelling: self.prefs.spelling() },
             typing_word: typing,
+            only_blocks: only,
         };
         let l = Arc::new(wordcraft_layout::layout(&self.doc, &mut self.cache, &opts));
-        self.layout = Some((self.rev, width, height, mode, spacing, l.clone(), self.view.proofing, outline, deleted, self.view.numeral, typing));
+        self.layout =
+            Some((self.rev, width, height, mode, spacing, l.clone(), self.view.proofing, outline, deleted, self.view.numeral, typing, only));
         l
     }
 
@@ -1121,6 +1132,7 @@ impl Session {
         self.new_header_parts.clear();
         self.go_back_step = 0;
         self.view.outline.collapsed.clear();
+        self.section_view = None;
         self.reset_history();
         self.touch();
         self.dirty = false;
@@ -1217,6 +1229,9 @@ impl Session {
             // Go Back's places, like the caret history: not part of the document.
             edit_marks: _,
             go_back_step: _,
+            // The host's policy and the section shown, like `view`: not part of the document.
+            policy: _,
+            section_view: _,
         } = self;
         let head = if history.len() + SNAPSHOT_HEAD > MAX_UNDO { history.iter().take(SNAPSHOT_HEAD).cloned().collect() } else { Vec::new() };
         EditSnapshot {
@@ -1286,11 +1301,12 @@ impl Session {
         if let Some(why) = (spec.enabled)(self) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
+        crate::cmd::cronos::check_policy(self, id, spec.mutates)?;
         // Restrict Editing: refused outright, or allowed as long as it only edits the exceptions.
         let guard = if spec.mutates { crate::cmd::protect::check_before(self, id, params)? } else { false };
         // Quick Parts aren't part of the document, so a refused edit puts them back itself (the Spike).
         let blocks_before = guard.then(|| self.building_blocks.clone());
-        if spec.mutates && self.doc.settings.protection.as_deref() == Some("trackedChanges") {
+        if spec.mutates && (self.policy.force_track_changes || self.doc.settings.protection.as_deref() == Some("trackedChanges")) {
             self.doc.settings.track_changes = true;
         }
         // Macro recording and Repeat.
@@ -1371,6 +1387,13 @@ impl Session {
         {
             result = Err(CmdError::Disabled(format!("{id}: only the editable regions of this protected document can change")));
         }
+        // Section view: only the section shown may change.
+        if result.is_ok()
+            && let Some((before, ..)) = &before_doc
+            && !crate::cmd::cronos::inside_section(self, before)
+        {
+            result = Err(CmdError::Disabled(format!("{id}: only the section shown can change")));
+        }
         match &result {
             Ok(_) => {
                 if spec.mutates {
@@ -1397,6 +1420,7 @@ impl Session {
                 }
                 // Outline view: collapsed headings follow edits; the caret stays where it shows.
                 crate::cmd::outline::after_command(self, &sel_before);
+                crate::cmd::cronos::after_command(self);
                 // Extra selected objects last until something else is edited or selected.
                 if !matches!(id, "select.addObject" | "arrange.ungroup") && (spec.mutates || self.sel != sel_before) {
                     self.also_selected.clear();
