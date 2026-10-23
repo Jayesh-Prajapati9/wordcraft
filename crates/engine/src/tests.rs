@@ -2289,7 +2289,9 @@ fn header_and_footer_commands_change_the_section_of_the_header_the_caret_is_in()
         s.doc.add_part(PartKind::Header, vec![std::sync::Arc::new(Block::Para(Paragraph::with_text(text, Default::default())))])
     };
     let (h1, h2) = (header(&mut s, "H1"), header(&mut s, "H2"));
+    let f1 = s.doc.add_part(PartKind::Footer, vec![std::sync::Arc::new(Block::Para(Paragraph::with_text("F1", Default::default())))]);
     s.doc.section_mut(0).headers.default = Some(h1);
+    s.doc.section_mut(0).footers.default = Some(f1);
     s.doc.last_section.headers.default = Some(h2);
     let first = s.doc.sections()[0].1.clone();
     let in_h2 = |s: &mut Session| s.sel = crate::Selection::caret(s.doc.start_of(StoryRef::Part(h2)));
@@ -2300,6 +2302,11 @@ fn header_and_footer_commands_change_the_section_of_the_header_the_caret_is_in()
     in_h2(&mut s);
     run(&mut s, "design.pageBorders", json!({"kind": "box"}));
     assert!(s.doc.last_section.page_borders.is_some());
+    // Section 2 has no footer of its own and shows section 1's: Edit Footer opens that one and
+    // keeps the link.
+    in_h2(&mut s);
+    assert_eq!(run(&mut s, "insert.editFooter", json!({}))["story"], f1);
+    assert_eq!(s.doc.last_section.footers.default, None, "section 2 stays linked");
     in_h2(&mut s);
     run(&mut s, "insert.footer", json!({"text": "F2"}));
     let f2 = s.doc.last_section.footers.default.expect("section 2 has the new footer");

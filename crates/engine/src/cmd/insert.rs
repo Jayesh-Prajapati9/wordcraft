@@ -629,15 +629,12 @@ fn edit_hf(s: &mut Session, v: &Value, header: bool) -> CmdResult {
     let shown = match page {
         Some(page) => shown_hf(s, page, header)?,
         None => {
+            // The caret's section's own, else the one it is linked to from a section before it, as
+            // layout shows it (#3639): editing that one keeps the link.
             let section = super::page::section_index_of_focus(s);
-            let set = s
-                .doc
-                .sections()
-                .into_iter()
-                .nth(section)
-                .or_else(|| s.doc.sections().pop())
-                .map(|(_, sp)| if header { sp.headers.default } else { sp.footers.default });
-            set.flatten().filter(|id| s.doc.parts.contains_key(id))
+            let sections = s.doc.sections();
+            let set = sections.iter().take(section + 1).rev().find_map(|(_, sp)| if header { sp.headers.default } else { sp.footers.default });
+            set.filter(|id| s.doc.parts.contains_key(id))
         }
     };
     let Some(id) = shown else {
