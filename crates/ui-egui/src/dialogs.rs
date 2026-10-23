@@ -1657,6 +1657,12 @@ pub(crate) fn buttons(ui: &mut Ui, ok: &str) -> (bool, bool) {
     r
 }
 
+/// The Font dialog preview's size: the Size box's points between 6 and 72, else 12. `"NaN"` and
+/// `"inf"` parse as floats too, and a NaN font size trips epaint's glyph assertion (#3663).
+fn preview_size(size: &str) -> f32 {
+    size.trim().parse::<f32>().ok().filter(|pt| pt.is_finite()).unwrap_or(12.0).clamp(6.0, 72.0)
+}
+
 /// The character properties the Font dialog's fields stand for.
 fn font_props(d: &Dialog) -> serde_json::Map<String, Value> {
     let Dialog::Font {
@@ -1784,7 +1790,7 @@ fn body(app: &mut WordApp, ui: &mut Ui, d: &mut Dialog) -> bool {
             ..
         } => {
             // Build the sample text format for the preview pane below.
-            let preview_size = size.trim().parse::<f32>().unwrap_or(12.0).clamp(6.0, 72.0);
+            let preview_size = preview_size(size);
             let preview_color = wordcraft_doc::Rgb::parse(color).map(crate::theme::c32).unwrap_or_else(|| ui.visuals().text_color());
             let mut fmt = egui::TextFormat {
                 font_id: egui::FontId::new(preview_size, egui::FontFamily::Proportional),
@@ -4583,6 +4589,32 @@ mod tests {
         for t in &tops {
             assert!((t - tops[0]).abs() <= 0.5, "the tab strip stays put: {tops:?}");
         }
+    }
+
+    /// #3663: "NaN" in the Font dialog's Size box parses as a float; the preview draws at 12 pt
+    /// instead of a NaN size, which tripped epaint's glyph assertion and closed the app.
+    #[test]
+    fn font_dialog_preview_ignores_a_size_that_is_not_a_number() {
+        for (typed, pt) in [("NaN", 12.0), ("nan", 12.0), ("inf", 12.0), ("-infinity", 12.0), ("10.5", 10.5), ("200", 72.0), ("", 12.0)] {
+            assert_eq!(preview_size(typed), pt, "{typed:?}");
+        }
+        let mut app = app_with("Example");
+        let _ = app.run("select.all", json!({}));
+        app.dialog = Dialog::open("font", &mut app);
+        let Some(Dialog::Font { size, .. }) = &mut app.dialog else { panic!("no font dialog") };
+        *size = "NaN".into();
+        let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1440.0, 900.0)).build_ui_state(
+            |ui, app: &mut WordApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        for _ in 0..4 {
+            h.step();
+        }
+        assert!(matches!(&h.state().dialog, Some(Dialog::Font { size, .. }) if size == "NaN"), "the dialog stays open");
     }
 
     #[test]
