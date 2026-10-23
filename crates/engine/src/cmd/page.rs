@@ -247,6 +247,14 @@ pub fn section_index_of_focus(s: &Session) -> usize {
     }
 }
 
+/// The last body block of the caret's section, the block [`wordcraft_doc::Document::section_mut`]
+/// takes. In a header or footer the caret's block index counts that story's paragraphs, not the
+/// body's, so it would name another section (#3639).
+pub fn section_end_of_focus(s: &Session) -> usize {
+    let i = section_index_of_focus(s);
+    s.doc.sections().get(i).map(|(end, _)| *end).unwrap_or(0)
+}
+
 pub fn sect(s: &Session) -> SectionProps {
     let i = section_index_of_focus(s);
     s.doc.sections().get(i).map(|(_, x)| (*x).clone()).unwrap_or_default()

@@ -562,7 +562,7 @@ fn bookmark(s: &mut Session, v: &Value) -> CmdResult {
 /// even page or the default), made when there is none: with Different First Page on, a header
 /// inserted on page 1 is the one page 1 shows (#2826).
 fn hf_part(s: &mut Session, header: bool) -> u32 {
-    let block = s.sel.focus.path.0.first().copied().unwrap_or(0) as usize;
+    let block = super::page::section_end_of_focus(s);
     let layout = s.layout();
     let page = if s.sel.focus.story == StoryRef::Body { layout.page_of(&s.sel.focus) } else { Some(s.page_hint) };
     let slot = page.and_then(|pg| layout.pages.get(pg)).map(|pg| pg.hf_slot).unwrap_or_default();
@@ -629,12 +629,12 @@ fn edit_hf(s: &mut Session, v: &Value, header: bool) -> CmdResult {
     let shown = match page {
         Some(page) => shown_hf(s, page, header)?,
         None => {
-            let block = s.sel.focus.path.0.first().copied().unwrap_or(0) as usize;
+            let section = super::page::section_index_of_focus(s);
             let set = s
                 .doc
                 .sections()
                 .into_iter()
-                .find(|(end, _)| block <= *end)
+                .nth(section)
                 .or_else(|| s.doc.sections().pop())
                 .map(|(_, sp)| if header { sp.headers.default } else { sp.footers.default });
             set.flatten().filter(|id| s.doc.parts.contains_key(id))
