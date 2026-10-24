@@ -221,7 +221,7 @@ pub(crate) fn picture(s: &mut Session, v: &Value) -> CmdResult {
     } else if let Some(path) = p::str(v, "path") {
         crate::io::read_file(path).map_err(CmdError::Failed)?
     } else {
-        s.ui_requests.push(json!({"open": "insertPicture"}));
+        s.push_ui_request(json!({"open": "insertPicture"}));
         return sel_result(s);
     };
     place_picture(s, bytes, p::f32(v, "width"), p::str(v, "alt").unwrap_or(""))
@@ -295,7 +295,7 @@ fn icon(s: &mut Session, v: &Value) -> CmdResult {
             .iter()
             .map(|i| json!({"id": i.id, "name": i.name, "category": i.category.name(), "keywords": i.keywords}))
             .collect();
-        s.ui_requests.push(json!({"open": "icons"}));
+        s.push_ui_request(json!({"open": "icons"}));
         return Ok(json!({"icons": icons}));
     };
     let icon = icon_lib::find(id).ok_or_else(|| CmdError::Params(format!("no icon {id:?} (insert.icon without an id lists them)")))?;
@@ -441,7 +441,7 @@ fn link(s: &mut Session, v: &Value) -> CmdResult {
         None => match place_target(s, v)? {
             Some(t) => t,
             None => {
-                s.ui_requests.push(json!({"open": "link"}));
+                s.push_ui_request(json!({"open": "link"}));
                 return sel_result(s);
             }
         },

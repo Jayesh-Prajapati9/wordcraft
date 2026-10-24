@@ -1154,7 +1154,7 @@ mod tests {
     }
 
     /// APFS refuses file names that aren't valid UTF-8, so the fixture can't be made on macOS
-    /// (as in `tests/non_utf8_args.rs`).
+    /// (as in `tests/it/non_utf8_args.rs`).
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn script_file_name_need_not_be_unicode() {

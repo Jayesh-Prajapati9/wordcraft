@@ -529,6 +529,7 @@ fn auto_tag(doc: &Document, src: &Source) -> String {
 }
 
 /// The author of a source for matching untagged entries: the editor when there is no author.
+#[cfg(not(target_arch = "wasm32"))]
 fn by_author(x: &Source) -> &str {
     if x.author.is_empty() { x.editor.as_str() } else { x.author.as_str() }
 }

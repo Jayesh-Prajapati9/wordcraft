@@ -112,9 +112,11 @@ fn symbol_param(v: &Value, k: &str) -> Option<char> {
 /// A date `YYYY-MM-DD` (a full ISO date-time is fine too): (year, month, day), checked.
 pub fn parse_date(t: &str) -> Option<(i64, u32, u32)> {
     let t = t.trim();
-    let y: i64 = t.get(0..4)?.parse().ok()?;
-    let m: u32 = t.get(5..7)?.parse().ok()?;
-    let d: u32 = t.get(8..10)?.parse().ok()?;
+    // Digits only: `str::parse` would also accept a leading '+'.
+    let field = |r: std::ops::Range<usize>| t.get(r).filter(|s| s.bytes().all(|b| b.is_ascii_digit()));
+    let y: i64 = field(0..4)?.parse().ok()?;
+    let m: u32 = field(5..7)?.parse().ok()?;
+    let d: u32 = field(8..10)?.parse().ok()?;
     if t.get(4..5) != Some("-") || t.get(7..8) != Some("-") || !(1..=9999).contains(&y) || !(1..=12).contains(&m) || d == 0 || d > days_in_month(y, m)
     {
         return None;
@@ -759,6 +761,15 @@ mod tests {
         assert_eq!(format_date_value("M/d/yyyy", 1970, 1, 1), "1/1/1970");
         assert_eq!(days_from_civil(1970, 1, 1), 0);
         assert_eq!(super::super::civil_from_days(days_from_civil(2000, 3, 1)), (2000, 3, 1));
+    }
+
+    #[test]
+    fn parse_date_rejects_signs_and_non_digits() {
+        for bad in ["2024-+1-+5", "+123-01-01", "2024-01-+5", "2024-+1-05", "-024-01-01"] {
+            assert_eq!(parse_date(bad), None, "{bad}");
+        }
+        assert_eq!(parse_date("2024-01-05"), Some((2024, 1, 5)));
+        assert_eq!(parse_date("2024-01-05T10:00:00"), Some((2024, 1, 5)));
     }
 
     #[test]

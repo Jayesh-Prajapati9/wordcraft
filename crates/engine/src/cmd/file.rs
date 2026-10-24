@@ -101,7 +101,7 @@ pub fn specs() -> Vec<CommandSpec> {
             // No path (the command search, say): the app asks where to save, as File › Export
             // does, instead of failing on the required parameter (#2313).
             let Some(path) = p::str(v, "path") else {
-                s.ui_requests.push(json!({"open": "exportPdf"}));
+                s.push_ui_request(json!({"open": "exportPdf"}));
                 return Ok(json!({"exported": false}));
             };
             let path = if path.to_ascii_lowercase().ends_with(".pdf") { path.to_string() } else { format!("{path}.pdf") };
@@ -127,13 +127,13 @@ pub fn specs() -> Vec<CommandSpec> {
             )
             .pure(),
         CommandSpec::new("file.print", "Print", "File", |s, _| {
-            s.ui_requests.push(json!({"open": "print"}));
+            s.push_ui_request(json!({"open": "print"}));
             sel_result(s)
         })
         .key("Mod+P / Mod+Shift+F12 / Mod+F2 / Mod+Alt+I")
         .pure(),
         CommandSpec::new("file.close", "Close", "File", |s, _| {
-            s.ui_requests.push(json!({"close": true}));
+            s.push_ui_request(json!({"close": true}));
             sel_result(s)
         })
         .key("Mod+W / Mod+F4")
@@ -227,7 +227,7 @@ fn normal_document(s: &Session) -> Document {
 /// Open a document, using the saved proofing default only for plain text and Markdown.
 fn open(s: &mut Session, v: &Value) -> CmdResult {
     let Some(path) = p::str(v, "path") else {
-        s.ui_requests.push(json!({"open": "openFile"}));
+        s.push_ui_request(json!({"open": "openFile"}));
         return sel_result(s);
     };
     let password = p::str(v, "password");
@@ -290,7 +290,7 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
     let path = match p::str(v, "path").map(std::path::PathBuf::from).or_else(|| s.path.clone()) {
         Some(p) => p,
         None => {
-            s.ui_requests.push(json!({"open": "saveAs"}));
+            s.push_ui_request(json!({"open": "saveAs"}));
             return Ok(json!({"saved": false}));
         }
     };
@@ -357,23 +357,29 @@ fn is_word_2003_file(_path: &std::path::Path) -> bool {
 
 fn save_as(s: &mut Session, v: &Value) -> CmdResult {
     if p::str(v, "path").is_none() {
-        s.ui_requests.push(json!({"open": "saveAs"}));
+        s.push_ui_request(json!({"open": "saveAs"}));
         return Ok(json!({"saved": false}));
     }
     save(s, v)
 }
 
 /// How a copy is written: Print Markup from the command's `markup`, else the File › Print
-/// setting (`file.printMarkup`); comments as Track Changes Options show them.
+/// setting (`file.printMarkup`); comments as Track Changes Options show them; digits as the
+/// Numeral setting shows them on screen.
 pub fn export_options(s: &Session, v: &Value) -> crate::io::ExportOptions {
     let markup = p::bool(v, "markup").unwrap_or(s.prefs.print_markup);
-    crate::io::ExportOptions { markup, comments: markup && s.prefs.markup.comments, word2003: p::str(v, "format") == Some(FORMAT_WORD_2003) }
+    crate::io::ExportOptions {
+        markup,
+        comments: markup && s.prefs.markup.comments,
+        word2003: p::str(v, "format") == Some(FORMAT_WORD_2003),
+        numeral: s.view.numeral.resolve(crate::session::system_locale()),
+    }
 }
 
 fn export_png(s: &mut Session, v: &Value) -> CmdResult {
     // No path: the app asks where to save, as file.exportPdf does (#2313).
     let Some(path) = p::str(v, "path") else {
-        s.ui_requests.push(json!({"open": "exportPng"}));
+        s.push_ui_request(json!({"open": "exportPng"}));
         return Ok(json!({"exported": false}));
     };
     let page = p::u64(v, "page").unwrap_or(1).max(1) as usize - 1;
@@ -384,6 +390,9 @@ fn export_png(s: &mut Session, v: &Value) -> CmdResult {
     // the on-screen cue while editing the body, not part of the page.
     let mut opts = wordcraft_render::RenderOptions::default();
     opts.display.dim_header = false;
+    if !path.to_ascii_lowercase().ends_with(".png") {
+        return Err(CmdError::Params("path must end in .png".into()));
+    }
     let img = wordcraft_render::render_page(&s.doc, pg, scale, &opts);
     let png = img.to_png();
     crate::io::write_file(path, &png).map_err(CmdError::Failed)?;

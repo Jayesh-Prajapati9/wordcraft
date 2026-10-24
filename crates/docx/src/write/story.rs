@@ -1126,8 +1126,12 @@ impl Writer<'_> {
                 None => w.open("wps:txbx", &[]),
             }
             w.open("w:txbxContent", &[]);
-            let blocks = part.blocks.clone();
-            self.blocks(w, &blocks, rels, false, depth + 1);
+            if self.written_boxes.insert(id) {
+                let blocks = part.blocks.clone();
+                self.blocks(w, &blocks, rels, false, depth + 1);
+            } else {
+                w.empty("w:p", &[]);
+            }
             w.close("w:txbxContent");
             w.close("wps:txbx");
             self.boxes.leave();

@@ -1644,6 +1644,39 @@ fn ole_object_round_trips() {
 }
 
 #[test]
+fn an_unqualified_relationship_attribute_round_trips() {
+    // A producer that left the relationship prefix out: the VML picture names its image with an
+    // unqualified `id`. The reader resolves it (the alias `El::attr` accepts), the writer keeps
+    // the attribute and gives it the id the new package holds the image under.
+    let body = r##"<w:p><w:r><w:object w:dxaOrig="1440" w:dyaOrig="720"><v:shape id="_x0000_i1025" type="#_x0000_t75" style="width:72pt;height:36pt" o:ole=""><v:imagedata id="rId8" o:title=""/></v:shape><o:OLEObject Type="Embed" ProgID="Package" ShapeID="_x0000_i1025" DrawAspect="Content" ObjectID="_1000000001" r:id="rId9"/></w:object></w:r></w:p>"##;
+    let picture = "\u{89}PNG stand-in";
+    let ole = "\u{d0}\u{cf} opaque OLE storage";
+    let types = r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="png" ContentType="image/png"/><Default Extension="bin" ContentType="application/vnd.openxmlformats-officedocument.oleObject"/></Types>"#;
+    let bytes = docx(
+        body,
+        &[("rId8", "image", "media/image1.png"), ("rId9", "oleObject", "embeddings/oleObject1.bin")],
+        &[("[Content_Types].xml", types), ("word/media/image1.png", picture), ("word/embeddings/oleObject1.bin", ole)],
+    );
+    let d = wordcraft_docx::read(&bytes).unwrap();
+    let Some(InlineObject::Image { ole: Some(_), .. }) = paras(&d)[0].objects.first() else { panic!("{:?}", paras(&d)[0].objects) };
+
+    let out = wordcraft_docx::write(&d).unwrap();
+    let files = unzip(&out);
+    let body = text(&files, "word/document.xml");
+    let rels = text(&files, "word/_rels/document.xml.rels");
+    // The attribute is still unqualified, and names the image the new package holds.
+    let [pic_id] = attr_values(&body, "v:imagedata", "id").try_into().unwrap();
+    let (kind, target) = rel(&rels, &pic_id);
+    assert!(kind.ends_with("/image"), "{kind}");
+    assert_eq!(files.get(&part_at("word", &target)).map(Vec::as_slice), Some(picture.as_bytes()));
+    // The object itself is kept whole, as before.
+    let [ole_id] = attr_values(&body, "o:OLEObject", "r:id").try_into().unwrap();
+    let (kind, target) = rel(&rels, &ole_id);
+    assert!(kind.ends_with("/oleObject"), "{kind}");
+    assert_eq!(files.get(&part_at("word", &target)).map(Vec::as_slice), Some(ole.as_bytes()));
+}
+
+#[test]
 fn signature_line_round_trips() {
     // Insert › Signature Line: a VML picture (the line, its X and the signer drawn in a metafile)
     // with an `o:signatureline` that makes it signable in Word. Saving keeps it a signature line,
