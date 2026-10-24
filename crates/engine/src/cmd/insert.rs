@@ -631,7 +631,7 @@ fn edit_hf(s: &mut Session, v: &Value, header: bool) -> CmdResult {
         None => {
             // The caret's section's own, else the one it is linked to from a section before it, as
             // layout shows it (#3639): editing that one keeps the link.
-            let section = super::page::section_index_of_focus(s);
+            let section = super::page::hf_section_of_focus(s);
             let sections = s.doc.sections();
             let set = sections.iter().take(section + 1).rev().find_map(|(_, sp)| if header { sp.headers.default } else { sp.footers.default });
             set.filter(|id| s.doc.parts.contains_key(id))

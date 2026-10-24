@@ -2319,6 +2319,28 @@ fn header_and_footer_commands_change_the_section_of_the_header_the_caret_is_in()
 
     assert_eq!(*s.doc.sections()[0].1, first, "section 1 is untouched");
     assert_eq!(s.doc.plain_text(StoryRef::Part(h1)), "H1");
+
+    // Section 2 now shows section 1's header and has its own footer. With the caret in that
+    // header on section 2's page, the commands change section 2, not section 1 that owns it.
+    let page2 = s.layout().pages.iter().position(|pg| pg.section == 1).expect("section 2 has a page");
+    assert_eq!(s.layout().pages[page2].header_story, Some(h1));
+    let in_h1 = |s: &mut Session, page: usize| {
+        s.sel = crate::Selection::caret(s.doc.start_of(StoryRef::Part(h1)));
+        s.page_hint = page;
+    };
+    in_h1(&mut s, page2);
+    assert_eq!(run(&mut s, "insert.editFooter", json!({}))["story"], f2, "Edit Footer opens the footer section 2 shows");
+    in_h1(&mut s, page2);
+    run(&mut s, "hf.position", json!({"header": 40}));
+    assert_eq!(s.doc.last_section.header, 40.0);
+    assert_eq!(*s.doc.sections()[0].1, first, "section 1 is untouched");
+    // On section 1's own page the same header is section 1's.
+    in_h1(&mut s, 0);
+    assert_eq!(run(&mut s, "insert.editFooter", json!({}))["story"], f1);
+    in_h1(&mut s, 0);
+    run(&mut s, "hf.position", json!({"header": 30}));
+    assert_eq!(s.doc.sections()[0].1.header, 30.0);
+    assert_eq!(s.doc.last_section.header, 40.0);
 }
 
 /// #1433: the smallest page there can be (0.1" wide, no margins, set straight through Page
