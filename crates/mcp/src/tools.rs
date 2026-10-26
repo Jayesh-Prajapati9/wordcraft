@@ -52,6 +52,7 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, ro: bool) -> Value {
     json!({"name": name, "title": title, "description": desc, "inputSchema": schema, "annotations": {"title": title, "readOnlyHint": ro, "openWorldHint": false}})
 }
 
+/// Every MCP tool with its title, description, input schema and annotations (`tools/list`).
 pub fn tool_definitions() -> Value {
     json!([
         tool(
@@ -102,7 +103,10 @@ pub fn tool_definitions() -> Value {
         tool(
             "type_text",
             "Type text",
-            "Type at the caret (replacing the selection). Use \\n... for line breaks inside text; use execute text.newParagraph for new paragraphs, or `paragraphs: true` to split lines into paragraphs.",
+            &format!(
+                "Type at the caret (replacing the selection). Use \\n... for line breaks inside text; use execute text.newParagraph for new paragraphs, or `paragraphs: true` to split lines into paragraphs (one undo step, at most {} lines).",
+                wordcraft_engine::cmd::text::MAX_TYPED_PARAGRAPHS
+            ),
             obj(json!({"text": s("Text"), "paragraphs": {"type": "boolean"}}), &["text"]),
             false
         ),
@@ -165,6 +169,8 @@ fn wrap(r: Result<Value, String>) -> ToolResult {
     }
 }
 
+/// Run tool `name` with arguments `a` through backend `b` (`tools/call`); unknown tools and
+/// failed calls are error results, never panics.
 pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
     let st = |k: &str| a.get(k).and_then(Value::as_str);
     match name {
@@ -229,22 +235,12 @@ pub fn call_tool(b: &mut dyn Backend, name: &str, a: &Value) -> ToolResult {
         "type_text" => {
             let t = st("text").unwrap_or("");
             if a.get("paragraphs").and_then(Value::as_bool).unwrap_or(false) {
-                let mut last = Ok(Value::Null);
-                for (i, line) in t.split('\n').enumerate() {
-                    if i > 0 {
-                        last = exec(b, "text.newParagraph", json!({}));
-                        if last.is_err() {
-                            break;
-                        }
-                    }
-                    if !line.is_empty() {
-                        last = exec(b, "text.insert", json!({"text": line, "raw": true}));
-                    }
-                    if last.is_err() {
-                        break;
-                    }
-                }
-                wrap(last)
+                // One `text.insert` with `paragraphs`: each break is Enter's own (its AutoFormat,
+                // and its refusal in a one-line control), but the lines go in as one edit and one
+                // undo step, all or nothing, instead of a command (and a whole-document undo
+                // snapshot) per line. The engine splits the lines and holds them to its cap
+                // (`MAX_TYPED_PARAGRAPHS`), for this tool and every other caller alike.
+                wrap(exec(b, "text.insert", json!({"text": t, "raw": true, "paragraphs": true})))
             } else {
                 wrap(exec(b, "text.insert", json!({"text": t, "raw": true})))
             }

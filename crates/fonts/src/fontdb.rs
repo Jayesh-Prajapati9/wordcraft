@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use kurbo::BezPath;
 use skrifa::instance::{Location, LocationRef, Size};
-use skrifa::outline::{DrawSettings, Engine, HintingInstance, HintingOptions, OutlinePen, Target};
+use skrifa::outline::{DrawSettings, Engine, Hinting, HintingInstance, HintingOptions, OutlinePen, Target};
 use skrifa::raw::FileRef;
 use skrifa::string::StringId;
 use skrifa::{GlyphId, MetadataProvider};
@@ -88,7 +88,43 @@ pub struct FontFace {
     bmp: std::sync::OnceLock<Box<[u64]>>,
     // Some legacy CJK fonts assemble their contours with TrueType instructions.
     outline_hinter: std::sync::OnceLock<Option<HintingInstance>>,
+    /// Hinted draws so far, those that ran too long, and whether that turned hinting off
+    /// ([`FontFace::count_hinted`]).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    hint_draws: std::sync::atomic::AtomicU32,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    hint_slow: std::sync::atomic::AtomicU32,
+    hinting_off: std::sync::atomic::AtomicBool,
 }
+
+/// Limits on what a face's TrueType instructions may run over (#3692). skrifa's interpreter budget
+/// counts instructions, not the points each one moves (SHZ, IUP… walk a whole zone), so a font with
+/// huge zones turns a short program into billions of point moves. Real fonts stay far below: a
+/// twilight zone of tens to hundreds of points, a stack of up to ~2,000 values, a few thousand
+/// points a glyph. Past them, glyphs are drawn unhinted.
+const MAX_HINT_TWILIGHT: u16 = 1024;
+const MAX_HINT_STACK: u16 = 4096;
+/// skrifa's buffer for one hinted glyph (points, stack, twilight zone, CVT and storage).
+const MAX_HINT_GLYPH_BYTES: usize = 256 * 1024;
+/// A hinted glyph slower than this is a strike against its face. A face under the limits above can
+/// still take seconds for one glyph, so [`MIN_HINT_STRIKES`] strikes that are also at least one
+/// in [`HINT_SLOW_RATIO`] of its hinted draws turn hinting off: a face that is slow throughout
+/// stops after a few glyphs, while the odd draw slowed by a busy machine leaves a face hinted.
+///
+/// Wall-clock, not interpreter work: skrifa's own budget (a million instructions a program, not
+/// settable) counts instructions, not the points each one moves, and it exposes no count of the
+/// work done, so time is the only measure there is (#3827). Whether such a face stays hinted can
+/// therefore depend on the machine, by design: only faces that need the interpreter to assemble
+/// their contours (legacy CJK fonts such as DFKai-SB) are hinted at all, and those typically hint
+/// a glyph in microseconds, so 50 ms is far above an honest face on a loaded machine; a face
+/// that trips it is drawn unhinted (its outlines possibly misassembled) rather than freezing the
+/// app. Native only (no clock on wasm).
+#[cfg(not(target_arch = "wasm32"))]
+const HINT_STRIKE: std::time::Duration = std::time::Duration::from_millis(50);
+#[cfg(not(target_arch = "wasm32"))]
+const MIN_HINT_STRIKES: u32 = 3;
+#[cfg(not(target_arch = "wasm32"))]
+const HINT_SLOW_RATIO: u32 = 16;
 
 /// A cheap `Copy` handle to a face. Faces are never unloaded, so the handle lives for the rest of
 /// the process; unlike cloning an `Arc`, copying it touches no shared reference count (which made
@@ -99,12 +135,12 @@ pub struct FaceRef(&'static FontFace);
 impl FaceRef {
     /// The handle for a loaded face (memoised per face).
     pub fn of(face: &Arc<FontFace>) -> FaceRef {
-        static LEAKED: RwLock<Vec<Option<&'static FontFace>>> = RwLock::new(Vec::new());
+        static LEAKED: RwLock<Vec<Option<&FontFace>>> = RwLock::new(Vec::new());
         let id = face.id as usize;
-        if let Some(Some(f)) = LEAKED.read().unwrap_or_else(|e| e.into_inner()).get(id) {
+        if let Some(Some(f)) = LEAKED.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(id) {
             return FaceRef(f);
         }
-        let mut w = LEAKED.write().unwrap_or_else(|e| e.into_inner());
+        let mut w = LEAKED.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if w.len() <= id {
             w.resize(id + 1, None);
         }
@@ -174,16 +210,64 @@ impl FontFace {
     pub fn id(&self) -> u32 {
         self.id
     }
+    /// Counts a hinted draw, `slow` when it ran past [`HINT_STRIKE`]; true when it is the one that
+    /// turns hinting off.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn count_hinted(&self, slow: bool) -> bool {
+        let draws = self.hint_draws.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if !slow {
+            return false;
+        }
+        let slow = self.hint_slow.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        slow >= MIN_HINT_STRIKES && slow.saturating_mul(HINT_SLOW_RATIO) >= draws && !self.hinting_off.swap(true, Ordering::Relaxed)
+    }
     /// Glyph `gid`'s outline in font units, y-down (flipped), uncached: for faces the database
     /// doesn't keep (font list previews); others go through [`FontDb::outline`]'s cache.
     pub fn glyph_outline(&self, gid: u32) -> BezPath {
-        let mut pen = FlipPen(BezPath::new());
+        self.draw_outline(gid, usize::MAX).path
+    }
+    /// [`FontFace::glyph_outline`], or None when the outline has more than `max_elements` path
+    /// elements: drawing stops copying them at the limit, so a huge glyph is never built whole.
+    pub fn glyph_outline_capped(&self, gid: u32, max_elements: usize) -> Option<BezPath> {
+        let pen = self.draw_outline(gid, max_elements);
+        (!pen.over).then_some(pen.path)
+    }
+    fn draw_outline(&self, gid: u32, max_elements: usize) -> FlipPen {
+        let mut pen = FlipPen { path: BezPath::new(), room: max_elements, over: false };
         if let Some(f) = self.skrifa()
             && let Some(g) = f.outline_glyphs().get(GlyphId::new(gid))
         {
-            let hinter = self.outline_hinter.get_or_init(|| {
+            let hinter =
+                self.hinter().filter(|_| !self.hinting_off.load(Ordering::Relaxed) && g.draw_memory_size(Hinting::Embedded) <= MAX_HINT_GLYPH_BYTES);
+            #[cfg(not(target_arch = "wasm32"))]
+            let started = std::time::Instant::now();
+            let settings = hinter.map_or_else(|| DrawSettings::unhinted(Size::unscaled(), self.location()), |h| DrawSettings::hinted(h, false));
+            let drawn = g.draw(settings, &mut pen);
+            #[cfg(not(target_arch = "wasm32"))]
+            if hinter.is_some() && self.count_hinted(started.elapsed() > HINT_STRIKE) {
+                log::warn!("Hinting glyph {gid} in {:?} took {:?}: drawing the face unhinted", self.family, started.elapsed());
+            }
+            if let Err(e) = drawn {
+                log::warn!("Cannot draw glyph {gid} in {:?}: {e}", self.family);
+                pen.path = BezPath::new();
+            }
+        }
+        pen
+    }
+    /// The face's TrueType interpreter, for the fonts that need one to assemble their contours and
+    /// whose zones are within the limits ([`MAX_HINT_TWILIGHT`]).
+    fn hinter(&self) -> Option<&HintingInstance> {
+        self.outline_hinter
+            .get_or_init(|| {
+                use skrifa::raw::TableProvider;
+                let f = self.skrifa()?;
                 let outlines = f.outline_glyphs();
                 if !outlines.require_interpreter() {
+                    return None;
+                }
+                let zones = f.maxp().ok().map(|m| (m.max_twilight_points().unwrap_or(0), m.max_stack_elements().unwrap_or(0)));
+                if !zones.is_some_and(|(twilight, stack)| twilight <= MAX_HINT_TWILIGHT && stack <= MAX_HINT_STACK) {
+                    log::warn!("{:?} asks for hinting zones of {zones:?}: drawing it unhinted", self.family);
                     return None;
                 }
                 // At UPEM pixels, hinted coordinates remain in font units. This
@@ -194,17 +278,10 @@ impl FontFace {
                     self.location(),
                     HintingOptions { engine: Engine::Interpreter, target: Target::Mono },
                 )
-                .map_err(|e| log::warn!("Cannot initialize outline interpreter for {}: {e}", self.family))
+                .map_err(|e| log::warn!("Cannot initialize outline interpreter for {:?}: {e}", self.family))
                 .ok()
-            });
-            let settings =
-                hinter.as_ref().map_or_else(|| DrawSettings::unhinted(Size::unscaled(), self.location()), |h| DrawSettings::hinted(h, false));
-            if let Err(e) = g.draw(settings, &mut pen) {
-                log::warn!("Cannot draw glyph {gid} in {}: {e}", self.family);
-                return BezPath::new();
-            }
-        }
-        pen.0
+            })
+            .as_ref()
     }
     /// Is `family` this face's typographic, legacy, full or PostScript name?
     pub fn named(&self, family: &str) -> bool {
@@ -825,7 +902,8 @@ fn font_faces(f: &skrifa::FontRef<'_>, index: u32) -> Vec<Found> {
     let east_asian = east_asian_font(f);
     let axes = f.axes();
     let mut named: Vec<Found> = Vec::new();
-    for ni in f.named_instances().iter() {
+    // At most one more than a file may add, so a caller can tell there are more (#3716).
+    for ni in f.named_instances().iter().take(MAX_FILE_FACES + 1) {
         let Some(style) = name(f, &[ni.subfamily_name_id()]) else { continue };
         if named.iter().any(|n| n.style.eq_ignore_ascii_case(&style)) {
             continue;
@@ -854,15 +932,25 @@ fn font_faces(f: &skrifa::FontRef<'_>, index: u32) -> Vec<Found> {
     }]
 }
 
-/// Parse every face in `data` (a font file or collection); a variable font yields one face per
-/// named instance.
-fn enumerate_faces(data: &[u8]) -> Vec<Found> {
+/// Most faces one font file adds (collection members, variable fonts' named instances).
+const MAX_FILE_FACES: usize = 256;
+
+/// Parse the faces in `data` (a font file or collection), at most `limit` of them; a variable
+/// font yields one face per named instance. A face with the family and style of an earlier one
+/// is left out (a collection can list one font many times, #3716).
+fn enumerate_faces(data: &[u8], limit: usize) -> Vec<Found> {
     let count = match FileRef::new(data) {
         Ok(FileRef::Font(_)) => 1,
-        Ok(FileRef::Collection(c)) => c.len(),
+        Ok(FileRef::Collection(c)) => c.len().min(u32::try_from(limit).unwrap_or(u32::MAX)),
         Err(_) => 0,
     };
-    (0..count).filter_map(|i| skrifa::FontRef::from_index(data, i).ok().map(|f| font_faces(&f, i))).flatten().collect()
+    let mut seen = std::collections::HashSet::new();
+    (0..count)
+        .filter_map(|i| skrifa::FontRef::from_index(data, i).ok().map(|f| font_faces(&f, i)))
+        .flatten()
+        .filter(|f| seen.insert((f.family.to_ascii_lowercase(), f.style.to_ascii_lowercase())))
+        .take(limit)
+        .collect()
 }
 
 /// The compiled-in Source Sans 3 Regular, for a database that somehow has no faces at all.
@@ -924,6 +1012,9 @@ fn make_face(bytes: FontBytes, index: u32, family: String, style: String, legacy
         index,
         bmp: std::sync::OnceLock::new(),
         outline_hinter: std::sync::OnceLock::new(),
+        hint_draws: Default::default(),
+        hint_slow: Default::default(),
+        hinting_off: Default::default(),
     })
 }
 
@@ -933,7 +1024,7 @@ pub fn base_style(style: &str) -> &str {
 }
 
 fn norm(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
 }
 
 /// Weight implied by a style name.
@@ -986,7 +1077,7 @@ impl FontDb {
         let others = crate::CRAFT_FONTS.iter().filter(|f| !f.scripts.contains(&"Jpan"));
         let craft = crate::japanese_document_fonts().into_iter().chain(others).map(|f| f.bytes);
         for data in BUNDLED.iter().copied().chain(craft) {
-            for f in enumerate_faces(data) {
+            for f in enumerate_faces(data, MAX_FILE_FACES) {
                 if let Some(mut face) = make_face(FontBytes::Static(data), f.index, f.family, f.style, f.legacy, f.coords) {
                     face.local_names = f.local;
                     faces.push(Arc::new(face));
@@ -1023,11 +1114,11 @@ impl FontDb {
     pub fn set_system_fallback(&self, on: bool) {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.sys.lock().unwrap_or_else(|e| e.into_inner()).enabled = on;
+            self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).enabled = on;
         }
         // Misses remembered while it was off may be found now.
-        self.fallbacks.write().unwrap_or_else(|e| e.into_inner()).map.clear();
-        *self.run_fallbacks.write().unwrap_or_else(|e| e.into_inner()) = RunFallbackCache::default();
+        self.fallbacks.write().unwrap_or_else(std::sync::PoisonError::into_inner).map.clear();
+        *self.run_fallbacks.write().unwrap_or_else(std::sync::PoisonError::into_inner) = RunFallbackCache::default();
         #[cfg(target_arch = "wasm32")]
         let _ = on;
     }
@@ -1041,14 +1132,14 @@ impl FontDb {
     }
 
     fn read_faces(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<FontFace>>> {
-        self.faces.read().unwrap_or_else(|e| e.into_inner())
+        self.faces.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The system font catalog, scanned first if it hasn't been yet.
     #[cfg(not(target_arch = "wasm32"))]
     fn read_catalog(&self) -> std::sync::RwLockReadGuard<'_, Vec<CatalogEntry>> {
         self.ensure_catalog();
-        self.catalog.read().unwrap_or_else(|e| e.into_inner())
+        self.catalog.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Family names available (loaded plus cataloged system fonts), sorted and deduplicated. Like
@@ -1173,7 +1264,7 @@ impl FontDb {
         for (bytes, name) in files {
             let data = Arc::new(bytes);
             let name: Option<String> = name.map(|n| n.trim().chars().take(MAX_FAMILY_NAME).collect()).filter(|n: &String| !n.is_empty());
-            for f in enumerate_faces(&data) {
+            for f in enumerate_faces(&data, MAX_FILE_FACES) {
                 if let Some(mut face) = make_face(FontBytes::Owned(data.clone()), f.index, f.family, f.style, f.legacy, f.coords) {
                     face.local_names = f.local;
                     if let Some(n) = name.as_deref().filter(|n| !face.named(n) && !face.local_names.iter().any(|l| l.name.eq_ignore_ascii_case(n))) {
@@ -1184,10 +1275,13 @@ impl FontDb {
                 }
             }
         }
-        let mut faces = self.faces.write().unwrap_or_else(|e| e.into_inner());
+        let mut faces = self.faces.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Indexed: a document's fonts may add hundreds of faces to thousands (#3716).
+        let key = |f: &FontFace| (f.family.to_ascii_lowercase(), f.style.to_ascii_lowercase());
+        let mut present: std::collections::HashSet<_> = faces.iter().map(|g| key(g)).collect();
         let mut added = 0;
         for f in new {
-            if !faces.iter().any(|g| g.family.eq_ignore_ascii_case(&f.family) && g.style.eq_ignore_ascii_case(&f.style)) {
+            if present.insert(key(&f)) {
                 faces.push(f);
                 added += 1;
             }
@@ -1243,7 +1337,7 @@ impl FontDb {
                     stack.push(p);
                     continue;
                 }
-                let ext = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+                let ext = p.extension().and_then(std::ffi::OsStr::to_str).map(str::to_ascii_lowercase);
                 if !matches!(ext.as_deref(), Some("ttf" | "otf" | "ttc" | "otc")) {
                     continue;
                 }
@@ -1263,7 +1357,7 @@ impl FontDb {
         }
         let n = found.len();
         log::debug!("cataloged {n} system font faces");
-        *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = found;
+        *self.catalog.write().unwrap_or_else(std::sync::PoisonError::into_inner) = found;
         self.catalog_gen.fetch_add(1, Ordering::AcqRel);
         n
     }
@@ -1273,7 +1367,7 @@ impl FontDb {
     /// its styles. Returns whether any face was added.
     #[cfg(not(target_arch = "wasm32"))]
     fn load_cataloged(&self, family: &str) -> bool {
-        let _loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
+        let _loading = self.loading.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Another lookup may have loaded it while this one waited.
         if self.is_loaded(family) {
             return true;
@@ -1282,7 +1376,7 @@ impl FontDb {
         let files = paths.iter().filter_map(|p| std::fs::read(p).ok()).map(|b| (b, None)).collect();
         let added = self.add_fonts(files) > 0;
         // The fallback searches' index: these files are loaded fonts now.
-        let mut index = self.coverage.lock().unwrap_or_else(|e| e.into_inner());
+        let mut index = self.coverage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for file in index.files.iter_mut().filter(|f| paths.contains(&f.path)) {
             file.used = true;
         }
@@ -1387,7 +1481,9 @@ impl FontDb {
             (best.path.clone(), best.family.clone(), best.style.clone())
         };
         let data = Arc::new(read_fallback_file(&path)?);
-        let found = enumerate_faces(&data).into_iter().find(|f| f.family.eq_ignore_ascii_case(&fam) && f.style.eq_ignore_ascii_case(&style))?;
+        let found = enumerate_faces(&data, MAX_FILE_FACES)
+            .into_iter()
+            .find(|f| f.family.eq_ignore_ascii_case(&fam) && f.style.eq_ignore_ascii_case(&style))?;
         let mut face = make_face(FontBytes::Owned(data), found.index, found.family, found.style, found.legacy, found.coords)?;
         face.local_names = found.local;
         Some(Arc::new(face))
@@ -1471,7 +1567,7 @@ impl FontDb {
         let mut f = make_face(base.bytes.clone(), base.index, base.family.clone(), style.to_string(), base.legacy_family.clone(), coords)?;
         f.local_names = base.local_names.clone();
         let f = Arc::new(f);
-        self.faces.write().unwrap_or_else(|e| e.into_inner()).push(f.clone());
+        self.faces.write().unwrap_or_else(std::sync::PoisonError::into_inner).push(f.clone());
         Some(f)
     }
 
@@ -1540,7 +1636,7 @@ impl FontDb {
     fn cached_fallback(&self, c: char, exclude: u32) -> Option<Arc<FontFace>> {
         let n = self.read_faces().len();
         {
-            let cache = self.fallbacks.read().unwrap_or_else(|e| e.into_inner());
+            let cache = self.fallbacks.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             if cache.faces == n
                 && let Some(hit) = cache.map.get(&(c, exclude))
             {
@@ -1554,7 +1650,7 @@ impl FontDb {
         if n != self.read_faces().len() {
             return found;
         }
-        let mut cache = self.fallbacks.write().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.fallbacks.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.faces != n || cache.map.len() >= FALLBACK_CACHE_MAX {
             cache.map.clear();
             cache.faces = n;
@@ -1587,7 +1683,7 @@ impl FontDb {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let enabled = self.sys.lock().unwrap_or_else(|e| e.into_inner()).enabled;
+            let enabled = self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).enabled;
             if enabled {
                 self.load_cataloged(FAMILY);
             }
@@ -1599,7 +1695,7 @@ impl FontDb {
     /// one search at a time.
     #[cfg(not(target_arch = "wasm32"))]
     fn system_search(&self, c: char, exclude: u32) -> (Option<Arc<FontFace>>, usize) {
-        let _searching = self.searching.lock().unwrap_or_else(|e| e.into_inner());
+        let _searching = self.searching.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // A search that held the lock first may have loaded a font covering `c`: choose among the
         // loaded faces again before loading more.
         let (found, n) = self.loaded_fallback(c, exclude);
@@ -1660,7 +1756,7 @@ impl FontDb {
         let key = (set, exclude, bold, italic);
         let n = self.read_faces().len();
         {
-            let cache = self.run_fallbacks.read().unwrap_or_else(|e| e.into_inner());
+            let cache = self.run_fallbacks.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             if cache.faces == n
                 && let Some(hit) = cache.map.get(&key)
             {
@@ -1671,7 +1767,7 @@ impl FontDb {
         // meanwhile by another thread (one its search, or a family named by a document) must make
         // a miss count as stale, not as the answer for the new count.
         let (found, n) = self.search_run(&key.0, exclude, bold, italic);
-        let mut cache = self.run_fallbacks.write().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.run_fallbacks.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.faces != n || cache.map.len() >= RUN_FALLBACK_CACHE_MAX || cache.chars.saturating_add(key.0.len()) > RUN_FALLBACK_CACHE_CHARS {
             cache.map.clear();
             cache.faces = n;
@@ -1750,7 +1846,7 @@ impl FontDb {
             return false;
         }
         {
-            let sys = self.sys.lock().unwrap_or_else(|e| e.into_inner());
+            let sys = self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if !sys.enabled || sys.misses.contains(&c) {
                 return false;
             }
@@ -1764,7 +1860,7 @@ impl FontDb {
             if self.is_loaded(fam) || !cataloged.iter().any(|f| f.eq_ignore_ascii_case(fam)) {
                 continue;
             }
-            if !self.sys.lock().unwrap_or_else(|e| e.into_inner()).tried.insert(fam) {
+            if !self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).tried.insert(fam) {
                 continue;
             }
             self.load_cataloged(fam);
@@ -1775,7 +1871,7 @@ impl FontDb {
         if self.indexed_fallback(c) {
             return true;
         }
-        let mut sys = self.sys.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sys = self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if sys.misses.len() >= SYS_MISSES_MAX {
             sys.misses.clear();
         }
@@ -1795,7 +1891,7 @@ impl FontDb {
     /// before the Regular.
     #[cfg(not(target_arch = "wasm32"))]
     fn indexed_run_fallback(&self, chars: &[char]) {
-        if !self.sys.lock().unwrap_or_else(|e| e.into_inner()).enabled || chars.iter().any(|c| c.is_control()) {
+        if !self.sys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).enabled || chars.iter().any(|c| c.is_control()) {
             return;
         }
         self.load_indexed(chars, true);
@@ -1811,13 +1907,14 @@ impl FontDb {
         let covered = |db: &FontDb| db.read_faces().iter().any(|f| chars.iter().all(|c| f.covers(*c)));
         let cps: Vec<u32> = chars.iter().map(|c| u32::from(*c)).collect();
         let maps_all = |ranges: &[(u32, u32)]| cps.iter().all(|cp| ranges_hold(ranges, *cp));
-        let mut index = self.coverage.lock().unwrap_or_else(|e| e.into_inner());
+        let mut index = self.coverage.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = self.catalog_gen.load(Ordering::Acquire);
         if index.generation != Some(generation) {
             // A new scan (or the first search): keep what is known of files still installed.
             let mut known: HashMap<std::path::PathBuf, IndexedFile> =
                 std::mem::take(&mut index.files).into_iter().map(|f| (f.path.clone(), f)).collect();
-            let mut paths: Vec<std::path::PathBuf> = self.catalog.read().unwrap_or_else(|e| e.into_inner()).iter().map(|e| e.path.clone()).collect();
+            let mut paths: Vec<std::path::PathBuf> =
+                self.catalog.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().map(|e| e.path.clone()).collect();
             paths.sort();
             paths.dedup();
             let files = paths
@@ -1880,11 +1977,11 @@ impl FontDb {
     /// Glyph outline in font units, y-down (flipped), cached per (face, glyph).
     pub fn outline(&self, face: &FontFace, gid: u32) -> Arc<BezPath> {
         let key = (face.id, gid);
-        if let Some(p) = self.outlines.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if let Some(p) = self.outlines.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
             return p.clone();
         }
         let p = Arc::new(face.glyph_outline(gid));
-        let mut cache = self.outlines.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.outlines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.len() >= OUTLINE_CACHE_MAX {
             cache.clear();
         }
@@ -1893,23 +1990,55 @@ impl FontDb {
     }
 }
 
-struct FlipPen(BezPath);
+/// Collects an outline flipped to y-down, keeping at most `room` path elements (`over` once it
+/// had to drop one).
+struct FlipPen {
+    path: BezPath,
+    room: usize,
+    over: bool,
+}
+
+impl FlipPen {
+    /// Take one element's room; false (and `over`) when there is none left.
+    fn take(&mut self) -> bool {
+        match self.room.checked_sub(1) {
+            Some(room) if !self.over => {
+                self.room = room;
+                true
+            }
+            _ => {
+                self.over = true;
+                false
+            }
+        }
+    }
+}
 
 impl OutlinePen for FlipPen {
     fn move_to(&mut self, x: f32, y: f32) {
-        self.0.move_to((x as f64, -y as f64));
+        if self.take() {
+            self.path.move_to((x as f64, -y as f64));
+        }
     }
     fn line_to(&mut self, x: f32, y: f32) {
-        self.0.line_to((x as f64, -y as f64));
+        if self.take() {
+            self.path.line_to((x as f64, -y as f64));
+        }
     }
     fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
-        self.0.quad_to((cx0 as f64, -cy0 as f64), (x as f64, -y as f64));
+        if self.take() {
+            self.path.quad_to((cx0 as f64, -cy0 as f64), (x as f64, -y as f64));
+        }
     }
     fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
-        self.0.curve_to((cx0 as f64, -cy0 as f64), (cx1 as f64, -cy1 as f64), (x as f64, -y as f64));
+        if self.take() {
+            self.path.curve_to((cx0 as f64, -cy0 as f64), (cx1 as f64, -cy1 as f64), (x as f64, -y as f64));
+        }
     }
     fn close(&mut self) {
-        self.0.close_path();
+        if self.take() {
+            self.path.close_path();
+        }
     }
 }
 
@@ -1920,6 +2049,24 @@ mod tests_sysfonts;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn occasional_slow_hinted_glyphs_do_not_turn_hinting_off() {
+        let off = |pattern: &[bool]| {
+            let face =
+                super::make_face(super::FontBytes::Static(super::BUNDLED[0]), 0, "T".into(), "Regular".into(), "T".into(), Vec::new()).unwrap();
+            pattern.iter().position(|&slow| face.count_hinted(slow))
+        };
+        // A face slow throughout stops at the third strike.
+        assert_eq!(off(&[true; 5]), Some(2));
+        // Three draws slowed by a busy machine among many: hinting stays on.
+        let mut busy = vec![false; 100];
+        busy.extend([true; 3]);
+        assert_eq!(off(&busy), None);
+        // Slow glyphs spread among fast ones still stop it once they are one in 16.
+        let spread: Vec<bool> = (0..64).map(|i| i % 8 == 7).collect();
+        assert_eq!(off(&spread), Some(23));
+    }
     #[test]
     #[ignore = "requires a locally licensed kaiu.ttf; set WORDCRAFT_TEST_KAI_FONT"]
     fn kai_contours_include_complete_character_body() {
@@ -1950,6 +2097,21 @@ mod tests {
         for d in ["/usr/share/fonts", "/run/host/fonts", "/run/host/local-fonts", "/run/host/user-fonts", "/run/host/user-fonts-legacy"] {
             assert!(dirs.contains(&std::path::PathBuf::from(d)), "{d} missing from {dirs:?}");
         }
+    }
+
+    #[test]
+    fn a_capped_outline_is_refused_while_it_is_drawn() {
+        // #3716 review: a colour glyph's clip outline stops growing at the payload left.
+        let db = FontDb::with_font_dirs(Vec::new());
+        db.set_system_fallback(false);
+        let face = db.face(FALLBACK_FAMILY, "Regular");
+        let gid = face.glyph_for('g');
+        let whole = face.glyph_outline(gid);
+        let n = whole.elements().len();
+        assert!(n > 4, "{n}");
+        assert_eq!(face.glyph_outline_capped(gid, n).as_ref().map(BezPath::elements), Some(whole.elements()));
+        assert!(face.glyph_outline_capped(gid, n - 1).is_none());
+        assert!(face.glyph_outline_capped(gid, 0).is_none());
     }
 
     #[test]
@@ -1998,10 +2160,31 @@ mod tests {
         }
         // A Thai font with OpenType tables, as the per-character fallback prefers.
         assert!(f.has_layout_tables(), "{} shapes Thai", f.family);
-        // Without system fonts no bundled face covers Thai: the caller keeps the per-character path.
+        // Without system fonts and without craft-fonts' Thai face (built in since craft-fonts
+        // 3d9ab3a1) no bundled face covers Thai: the caller keeps the per-character path.
         let bundled = FontDb::with_font_dirs(Vec::new());
         bundled.set_system_fallback(false);
         let latin = bundled.face(FALLBACK_FAMILY, "Regular");
+        // Expected from the embedded font list, not from the database under test.
+        let thai_bundled = crate::CRAFT_FONTS.iter().any(|f| f.scripts.contains(&"Thai"));
+        assert_eq!(bundled.fallback_for('น', 0).is_some(), thai_bundled);
+        assert_eq!(bundled.fallback_for_run(&chars, latin.id(), false, false).is_some(), thai_bundled);
+    }
+
+    /// With only bundled Latin faces and no system fallback, a Thai run has no single covering face,
+    /// so run-level fallback declines. This test asserts that `fallback_for_run` returns `None`; the
+    /// caller's per-character path is not exercised here.
+    #[test]
+    fn a_run_without_a_covering_face_keeps_the_per_character_path() {
+        // Use only this repository's Latin faces. Optional craft-fonts inputs can contain a
+        // complete Thai face even when system font loading is disabled.
+        let bundled = FontDb::with_font_dirs(Vec::new());
+        bundled.faces.write().unwrap().retain(|face| BUNDLED.iter().any(|bytes| std::ptr::eq(face.data(), *bytes)));
+        bundled.set_system_fallback(false);
+        let latin = bundled.face(FALLBACK_FAMILY, "Regular");
+        let chars: Vec<char> = THAI_RUN.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(!bundled.faces.read().unwrap().is_empty(), "the negative fixture retains real Latin faces");
+        assert!(bundled.faces.read().unwrap().iter().all(|face| !face.covers('น')));
         assert!(bundled.fallback_for_run(&chars, latin.id(), false, false).is_none());
     }
 
@@ -2104,5 +2287,113 @@ mod tests {
         }
         assert!(!db.has_family("NotAFont-Bold"));
         assert_eq!(db.face("Source Serif 4", "Regular").style, "Regular");
+    }
+
+    /// A variable font holding just `name` and `fvar` tables: family "Var Test", one `wght` axis
+    /// and `instances` named instances, each with its own style name.
+    fn variable_font(instances: u16) -> Vec<u8> {
+        let mut names: Vec<(u16, String)> = vec![(1, "Var Test".into()), (2, "Regular".into())];
+        names.extend((0..instances).map(|i| (256 + i, format!("Style {i}"))));
+        let mut name = vec![0, 0];
+        name.extend_from_slice(&(names.len() as u16).to_be_bytes());
+        name.extend_from_slice(&(6 + 12 * names.len() as u16).to_be_bytes());
+        let mut strings = Vec::new();
+        for (id, text) in &names {
+            let utf16: Vec<u8> = text.encode_utf16().flat_map(u16::to_be_bytes).collect();
+            for v in [3, 1, 0x409, *id, utf16.len() as u16, strings.len() as u16] {
+                name.extend_from_slice(&v.to_be_bytes());
+            }
+            strings.extend(utf16);
+        }
+        name.extend(strings);
+        let mut fvar = Vec::new();
+        for v in [1u16, 0, 16, 2, 1, 20, instances, 8] {
+            fvar.extend_from_slice(&v.to_be_bytes());
+        }
+        fvar.extend_from_slice(b"wght");
+        for v in [100u32 << 16, 400 << 16, 900 << 16] {
+            fvar.extend_from_slice(&v.to_be_bytes());
+        }
+        fvar.extend_from_slice(&[0, 0, 0, 2]); // flags, axisNameId
+        for i in 0..instances {
+            fvar.extend_from_slice(&(256 + i).to_be_bytes());
+            fvar.extend_from_slice(&[0, 0]);
+            fvar.extend_from_slice(&(400u32 << 16).to_be_bytes());
+        }
+        mini_font(&[(*b"fvar", fvar), (*b"name", name)])
+    }
+
+    /// A collection listing `font` `members` times.
+    fn collection_of(font: &[u8], members: u32) -> Vec<u8> {
+        let start = 12 + 4 * members;
+        let mut out = b"ttcf\0\x01\0\0".to_vec();
+        out.extend_from_slice(&members.to_be_bytes());
+        for _ in 0..members {
+            out.extend_from_slice(&start.to_be_bytes());
+        }
+        let mut font = font.to_vec();
+        let tables = u16::from_be_bytes([font[4], font[5]]) as usize;
+        for i in 0..tables {
+            let at = 12 + 16 * i + 8;
+            let offset = u32::from_be_bytes(font[at..at + 4].try_into().unwrap()) + start;
+            font[at..at + 4].copy_from_slice(&offset.to_be_bytes());
+        }
+        out.extend(font);
+        out
+    }
+
+    /// JetBrains Mono renamed "MingLiU JBMono" (a name the interpreter is required for), with its
+    /// `maxp` twilight-zone size set to `twilight`.
+    fn hint_reliant_font(twilight: u16) -> Vec<u8> {
+        let mut data = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/JetBrainsMono-Regular.ttf")).unwrap();
+        let utf16 = |s: &str| s.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<u8>>();
+        for (from, to) in [(utf16("JetBrains Mono"), utf16("MingLiU JBMono")), (b"JetBrains Mono".to_vec(), b"MingLiU JBMono".to_vec())] {
+            while let Some(at) = data.windows(from.len()).position(|w| w == from) {
+                data[at..at + to.len()].copy_from_slice(&to);
+            }
+        }
+        let tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+        let entry = (0..tables).map(|i| 12 + 16 * i).find(|e| &data[*e..e + 4] == b"maxp").unwrap();
+        let maxp = u32::from_be_bytes(data[entry + 8..entry + 12].try_into().unwrap()) as usize;
+        data[maxp + 16..maxp + 18].copy_from_slice(&twilight.to_be_bytes());
+        data
+    }
+
+    #[test]
+    fn a_font_asking_for_huge_hinting_zones_is_drawn_unhinted() {
+        // #3692: skrifa's budget counts instructions, not the points each one moves.
+        let db = FontDb::with_font_dirs(vec![]);
+        db.add_font(hint_reliant_font(660));
+        let face = db.face("MingLiU JBMono", "Regular");
+        assert_eq!(face.family, "MingLiU JBMono");
+        assert!(face.hinter().is_some(), "a real font's zones are hinted");
+        assert!(!face.glyph_outline(face.glyph_for('a')).elements().is_empty());
+        let db = FontDb::with_font_dirs(vec![]);
+        db.add_font(hint_reliant_font(u16::MAX));
+        let face = db.face("MingLiU JBMono", "Regular");
+        assert!(face.hinter().is_none(), "a huge twilight zone is not hinted");
+        assert!(!face.glyph_outline(face.glyph_for('a')).elements().is_empty(), "drawn unhinted");
+    }
+
+    #[test]
+    fn named_instances_and_collection_members_are_capped() {
+        // #3716: a file's faces are capped before they are built, however the file multiplies them.
+        let font = variable_font(300);
+        let faces = font_faces(&skrifa::FontRef::new(&font).unwrap(), 0);
+        assert_eq!(faces.len(), MAX_FILE_FACES + 1, "one more than the cap, so a caller can tell");
+        assert_eq!(faces[0].style, "Style 0");
+        assert_eq!(enumerate_faces(&font, MAX_FILE_FACES).len(), MAX_FILE_FACES);
+        // A million members, all the same font: read once, and no more than the cap.
+        let started = std::time::Instant::now();
+        let ttc = collection_of(BUNDLED[0], 1_000_000);
+        let found = enumerate_faces(&ttc, MAX_FILE_FACES);
+        assert_eq!(found.iter().map(|f| (f.family.as_str(), f.style.as_str())).collect::<Vec<_>>(), [(FALLBACK_FAMILY, "Regular")]);
+        let db = FontDb::with_font_dirs(vec![]);
+        assert_eq!(db.add_font(collection_of(&font, 1_000_000)), MAX_FILE_FACES);
+        // A font the user adds is refused instead.
+        assert!(matches!(db.install_font("v.ttf", &variable_font(300)), Err(user::UserFontError::Unusable(e)) if e.contains("more than 256")));
+        // The face counts above are what tell the old code (a face per member) apart; the time
+        // (under 0.1 s on a loaded machine) only backs up "read once", with room for a busy CI.
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
     }
 }

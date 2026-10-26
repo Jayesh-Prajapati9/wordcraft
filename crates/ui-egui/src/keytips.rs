@@ -9,16 +9,19 @@ use crate::theme::{Tokens, semibold};
 
 /// egui ids the ribbon publishes its keytip state under (accessors, since `Id::new` isn't const).
 pub fn phase_id() -> egui::Id {
-    egui::Id::new("wc_keytips_phase")
+    egui::Id::unique("wc_keytips_phase")
 }
+/// Stable id for the keytips' selected-tab state.
 pub fn tab_id() -> egui::Id {
-    egui::Id::new("wc_keytips_tab")
+    egui::Id::unique("wc_keytips_tab")
 }
+/// Stable id for the keytips' letter badges.
 pub fn letters_id() -> egui::Id {
-    egui::Id::new("wc_keytips_letters")
+    egui::Id::unique("wc_keytips_letters")
 }
+/// Stable id for the keytips' badge rectangles.
 pub fn rects_id() -> egui::Id {
-    egui::Id::new("wc_keytips_rects")
+    egui::Id::unique("wc_keytips_rects")
 }
 
 /// A bare Alt press (either Alt key) arms or cancels keytips.
@@ -434,10 +437,10 @@ fn letters_for(app: &WordApp, tab: &str) -> Vec<String> {
         v.extend(own);
         let words: Vec<&str> = ctl.tip.split_whitespace().filter(|w| w.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())).collect();
         if let Some(w) = words.first() {
-            v.extend(w.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()));
+            v.extend(w.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()));
         }
         if words.len() > 1 {
-            v.extend(words.iter().map(|w| w.chars().next().unwrap_or(' ')).filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()));
+            v.extend(words.iter().map(|w| w.chars().next().unwrap_or(' ')).filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_uppercase()));
         }
         v
     };
@@ -486,7 +489,7 @@ fn letters_for(app: &WordApp, tab: &str) -> Vec<String> {
             }
         }
     }
-    out.into_iter().map(|o| o.unwrap_or_default()).collect()
+    out.into_iter().map(Option::unwrap_or_default).collect()
 }
 
 /// Pure letter assignment `(tab letters, per-tab control letters)`, for tests without a window.
@@ -863,7 +866,7 @@ fn legacy_hint(app: &WordApp, ui: &Ui, tabs: Option<Rect>) {
     let font = egui::FontId::proportional(12.0);
     let galley = ui.ctx().fonts_mut(|f| f.layout_no_wrap(text, font, t.text));
     let r = Rect::from_min_size(tabs.left_bottom() + Vec2::new(4.0, 2.0), galley.size() + Vec2::new(16.0, 10.0));
-    let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("wc_legacy_keys")));
+    let p = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("wc_legacy_keys")));
     p.rect_filled(r, CornerRadius::same(4), t.menu);
     p.rect_stroke(r, CornerRadius::same(4), Stroke::new(1.0, t.border), egui::StrokeKind::Inside);
     p.galley(r.min + Vec2::new(8.0, 5.0), galley, t.text);
