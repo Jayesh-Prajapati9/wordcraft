@@ -551,8 +551,7 @@ pub fn specs() -> Vec<CommandSpec> {
             let mut doc = crate::io::open_path(std::path::Path::new(path)).map_err(CmdError::Failed)?;
             // As in Word, the new document is attached to the template it came from (#2852).
             doc.settings.attached_template = Some(path.to_string());
-            s.set_document(doc);
-            s.path = None;
+            s.add_document(doc);
             s.dirty = true;
             sel_result(s)
         })

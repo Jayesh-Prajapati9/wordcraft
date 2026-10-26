@@ -313,3 +313,45 @@ fn over_long_request_line_is_rejected_and_serving_continues() {
     assert!(lines[0].contains("too long"), "{}", lines[0]);
     assert!(lines[1].contains(r#""id":5"#), "{}", lines[1]);
 }
+
+/// W1: with several documents open, `doc` sends a tool to one of them; the active document stays
+/// active and unchanged, and an id that names no open document is an error.
+#[test]
+fn tools_address_an_open_document_by_id() {
+    let mut s = Server::new(Box::new(Headless::default()));
+    let first = tool(&mut s, "new_document", json!({}))["id"].as_u64().expect("new_document gives the id");
+    tool(&mut s, "type_text", json!({"text": "First"}));
+    let second = tool(&mut s, "new_document", json!({}))["id"].as_u64().expect("new_document gives the id");
+    assert_ne!(first, second);
+    tool(&mut s, "type_text", json!({"text": "Second"}));
+
+    tool(&mut s, "execute", json!({"command": "text.insert", "params": {"text": " more"}, "doc": first}));
+    tool(&mut s, "batch", json!({"commands": [{"command": "text.insert", "params": {"text": " again"}}], "doc": first}));
+    assert_eq!(tool(&mut s, "get_text", json!({"doc": first}))["text"].as_str().unwrap().trim(), "First more again");
+    assert_eq!(tool(&mut s, "get_text", json!({}))["text"].as_str().unwrap().trim(), "Second");
+    let inspected = tool(&mut s, "inspect_document", json!({"doc": first}));
+    assert_eq!(inspected["blocks"][0]["text"], "First more again");
+    let r = call(&mut s, 12, "tools/call", json!({"name": "render_page", "arguments": {"doc": first, "scale": 0.2}}));
+    assert_eq!(r["result"]["content"][0]["type"], "image", "{r}");
+
+    let list = tool(&mut s, "list_documents", json!({}));
+    let docs = list["documents"].as_array().unwrap();
+    let ids: Vec<u64> = docs.iter().filter_map(|d| d["id"].as_u64()).collect();
+    assert!(ids.contains(&first) && ids.contains(&second), "{list}");
+    let active: Vec<u64> = docs.iter().filter(|d| d["active"] == true).filter_map(|d| d["id"].as_u64()).collect();
+    assert_eq!(active, vec![second]);
+
+    for bad in [json!(u64::MAX), json!(-1), json!("1"), json!(first.to_string()), json!(1.5), json!(1e300), json!({}), json!([first])] {
+        for (name, args) in [
+            ("execute", json!({"command": "text.insert", "params": {"text": "x"}, "doc": bad})),
+            ("get_text", json!({"doc": bad})),
+            ("inspect_document", json!({"doc": bad})),
+            ("render_page", json!({"doc": bad})),
+        ] {
+            let r = call(&mut s, 13, "tools/call", json!({"name": name, "arguments": args}));
+            assert_eq!(r["result"]["isError"], true, "{name} with doc {bad}: {r}");
+        }
+    }
+    assert_eq!(tool(&mut s, "get_text", json!({}))["text"].as_str().unwrap().trim(), "Second");
+    assert_eq!(tool(&mut s, "get_text", json!({"doc": first}))["text"].as_str().unwrap().trim(), "First more again");
+}

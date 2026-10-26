@@ -1096,10 +1096,8 @@ fn finish(s: &mut Session, v: &Value) -> CmdResult {
         crate::io::save_path(std::path::Path::new(path), &out).map_err(CmdError::Failed)?;
         return Ok(json!({"records": count, "path": path}));
     }
-    s.set_document(out);
-    s.path = None;
+    s.add_document(out);
     s.dirty = true;
-    s.merge.preview = false;
     Ok(json!({"records": count}))
 }
 
@@ -1261,8 +1259,7 @@ fn envelopes(s: &mut Session, v: &Value) -> CmdResult {
     let mut d = Document::new();
     d.last_section = sect;
     d.body = blocks;
-    s.set_document(d);
-    s.path = None;
+    s.add_document(d);
     Ok(json!({"width": w, "height": h}))
 }
 
@@ -1494,8 +1491,7 @@ fn labels(s: &mut Session, v: &Value) -> CmdResult {
         }
     }
     d.body = vec![std::sync::Arc::new(Block::Table(t)), para_block(Paragraph::new())];
-    s.set_document(d);
-    s.path = None;
+    s.add_document(d);
     let _ = Pos::body(0, 0);
     Ok(json!({"labels": if single.is_some() { 1 } else { rows * cols }, "filled": made, "product": prod.id}))
 }
